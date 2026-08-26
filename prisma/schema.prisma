@@ -1,0 +1,301 @@
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ---- Shopify session storage (required by shopify-app-remix) ----
+model Session {
+  id            String    @id
+  shop          String
+  state         String
+  isOnline      Boolean   @default(false)
+  scope         String?
+  expires       DateTime?
+  accessToken   String
+  userId        BigInt?
+  firstName     String?
+  lastName      String?
+  email         String?
+  accountOwner  Boolean   @default(false)
+  locale        String?
+  collaborator  Boolean?  @default(false)
+  emailVerified Boolean?  @default(false)
+}
+
+// ---- Per-shop automation configuration ----
+model Shop {
+  id                String   @id @default(cuid())
+  domain            String   @unique
+  installedAt       DateTime @default(now())
+  returnWindowDays  Int      @default(30)
+  currency          String   @default("USD")
+
+  rules         AutomationRule[]
+  returns       ReturnRequest[]
+  cancellations CancellationRequest[]
+  rtoShipments  RTOShipment[]
+  replacements  ReplacementOrder[]
+}
+
+// A rule = "when a return matches these conditions, do this action"
+// Automations shipped: EXCHANGE_SUGGEST, cancellation auto-approve, RTO auto-restock
+model AutomationRule {
+  id        String   @id @default(cuid())
+  shopId    String
+  shop      Shop     @relation(fields: [shopId], references: [id])
+  name      String
+  isActive  Boolean  @default(true)
+  priority  Int      @default(0) // lower runs first
+
+  // Match conditions (all optional / nullable = wildcard)
+  matchReasons     String? // comma-separated: "wrong_size,changed_mind"
+  matchMinOrderVal Float?
+  matchMaxOrderVal Float?
+  matchTags        String? // product tag filter, comma-separated
+  matchWithinDays  Int?    // only trigger if requested within N days of delivery
+
+  // Cancellation-specific matching: only auto-approve if order hasn't
+  // reached these fulfillment/time cutoffs yet
+  matchOnlyUnfulfilled  Boolean? @default(true)
+  matchCutoffHours      Int?     // e.g. 6 = only auto-approve if requested within 6h of order placed
+
+  // RTO-specific matching
+  matchRtoReasons String? // comma-separated: "address_issue,customer_unavailable,refused,cod_refused"
+
+  // Replacement/warranty-specific matching
+  matchMaxReplacementValue Float? // auto-approve free replacements up to this item value; above it routes to review
+
+  // Action: what the rule does
+  action           RuleAction @default(SUGGEST_EXCHANGE)
+  incentivePercent Float?     @default(0) // extra store-credit % to sweeten exchange vs refund
+  autoApprove      Boolean    @default(false)
+  rtoAction        RTOAction? // what to do automatically when an RTO lands, if action = RTO_AUTO_ACTION
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum RuleAction {
+  SUGGEST_EXCHANGE      // show exchange options before refund option
+  AUTO_APPROVE
+  AUTO_REJECT
+  ROUTE_TO_REVIEW
+  CANCELLATION_AUTO_APPROVE // auto-approve self-serve order cancellations that meet cutoff conditions
+  RTO_AUTO_ACTION            // automatically restock / refund / reship when a courier-initiated RTO lands
+  REPLACEMENT_AUTO_APPROVE   // auto-approve free replacement/warranty bookings under a value threshold
+}
+
+model ReturnRequest {
+  id             String       @id @default(cuid())
+  shopId         String
+  shop           Shop         @relation(fields: [shopId], references: [id])
+  shopifyOrderId String
+  orderName      String
+  customerEmail  String
+  customerName   String?
+  status         ReturnStatus @default(PENDING)
+  reason         String
+  requestedAt    DateTime     @default(now())
+  decidedAt      DateTime?
+
+  // Outcome of the exchange-suggestion automation
+  offeredExchange   Boolean  @default(false)
+  exchangeAccepted  Boolean?
+  exchangeVariantId String? // the variant the customer chose instead of a refund
+  incentiveApplied  Float?  @default(0)
+
+  items ReturnLineItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum ReturnStatus {
+  PENDING
+  EXCHANGE_OFFERED
+  EXCHANGE_ACCEPTED
+  REFUND_APPROVED
+  REJECTED
+  COMPLETED
+}
+
+model ReturnLineItem {
+  id              String        @id @default(cuid())
+  returnRequestId String
+  returnRequest   ReturnRequest @relation(fields: [returnRequestId], references: [id])
+  shopifyLineItemId String
+  productId       String
+  variantId       String
+  title           String
+  variantTitle    String?
+  quantity        Int           @default(1)
+  price           Float
+  imageUrl        String?
+}
+
+// ── Order Cancellation ──────────────────────────────────────────────────
+// Self-serve cancellation of an order BEFORE it ships (distinct from a
+// return, which happens after delivery). Modeled on QuickReturns'
+// cancellation flow: customer requests, cutoff/fulfillment rules decide
+// whether it's auto-approved or routed to the merchant.
+model CancellationRequest {
+  id             String             @id @default(cuid())
+  shopId         String
+  shop           Shop               @relation(fields: [shopId], references: [id])
+  shopifyOrderId String
+  orderName      String
+  orderValue     Float
+  customerEmail  String
+  customerName   String?
+  reason         String
+  wasFulfilled   Boolean            @default(false) // fulfillment status at time of request
+  hoursSinceOrder Float
+  status         CancellationStatus @default(PENDING)
+  refundMethod   RefundMethod       @default(ORIGINAL_PAYMENT)
+  requestedAt    DateTime           @default(now())
+  decidedAt      DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum CancellationStatus {
+  PENDING
+  AUTO_APPROVED
+  APPROVED
+  REJECTED   // usually because order already fulfilled/shipped
+  COMPLETED  // order cancelled + refund/restock done
+}
+
+enum RefundMethod {
+  ORIGINAL_PAYMENT
+  STORE_CREDIT
+}
+
+// ── RTO (Return To Origin) ──────────────────────────────────────────────
+// Courier-initiated: the shipment could not be delivered and is coming
+// back to the warehouse. Deliberately a SEPARATE model/status track from
+// ReturnRequest (customer-initiated), matching how QuickReturns and
+// carrier platforms (Eshopbox etc.) keep RTO distinct from RVP/returns.
+model RTOShipment {
+  id             String     @id @default(cuid())
+  shopId         String
+  shop           Shop       @relation(fields: [shopId], references: [id])
+  shopifyOrderId String
+  orderName      String
+  trackingNumber String?
+  carrier        String?
+  codAmount      Float?     @default(0) // amount to reconcile if this was a COD order
+  rtoReason      RTOReason  @default(OTHER)
+  status         RTOStatus  @default(FLAGGED)
+  actionTaken    RTOAction?
+  flaggedAt      DateTime   @default(now())
+  receivedAt     DateTime?  // when the parcel physically arrived back at warehouse
+  resolvedAt     DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum RTOReason {
+  ADDRESS_ISSUE        // incomplete/incorrect address
+  OUT_OF_DELIVERY_AREA
+  CUSTOMER_UNAVAILABLE
+  DELIVERY_REFUSED
+  COD_PAYMENT_REFUSED
+  CUSTOMER_REQUESTED_CANCEL
+  OTHER
+}
+
+enum RTOStatus {
+  FLAGGED           // courier reported failed delivery, parcel heading back
+  IN_TRANSIT        // confirmed en route back to warehouse
+  RECEIVED_AT_ORIGIN // physically back in the warehouse
+  RESOLVED          // inventory + refund/reship action completed
+}
+
+enum RTOAction {
+  RESTOCK_INVENTORY
+  REFUND_CUSTOMER
+  RESCHEDULE_SHIPMENT
+  FLAG_FOR_REVIEW
+}
+
+// ── Manual Replacement / Warranty Orders ─────────────────────────────────
+// A free ($0) order booked directly by staff inside this app — for cases
+// that never touch the normal return/exchange flow because there's no
+// Shopify order tied to the claim: a marketplace purchase (Amazon,
+// Flipkart, etc.) arrived damaged, an offline/in-store purchase was
+// defective, or a warranty claim came in outside any order record. Staff
+// books it here and we create a $0 draft order in Shopify to fulfill it.
+model ReplacementOrder {
+  id     String @id @default(cuid())
+  shopId String
+  shop   Shop   @relation(fields: [shopId], references: [id])
+
+  source               ReplacementSource
+  damageType           DamageType
+  marketplaceName      String? // "Amazon", "Flipkart", "In-store - MG Road", etc
+  externalOrderRef     String? // marketplace order ID / offline invoice number
+  originalPurchaseDate DateTime?
+  proofImageUrls       String? // comma-separated URLs of damage/defect photos
+
+  customerEmail    String
+  customerName     String?
+  customerPhone    String?
+  shippingAddress  String? // JSON-encoded address block
+  notes            String?
+  estimatedValue   Float   @default(0) // catalog value of items being replaced, for rule thresholds
+
+  status          ReplacementStatus @default(PENDING_REVIEW)
+  bookedByStaff   String? // admin user/email who booked it
+  shopifyDraftOrderId String?
+  shopifyOrderId      String? // set once the $0 draft order is completed into a real order
+  reviewedAt      DateTime?
+
+  items ReplacementLineItem[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum ReplacementSource {
+  MARKETPLACE       // Amazon, Flipkart, Etsy, etc — no Shopify order exists
+  OFFLINE_STORE     // in-person / retail purchase
+  WARRANTY_CLAIM     // warranty claim, purchase channel may be unknown/irrelevant
+  SHOPIFY_ORDER      // damaged/defective item from a real Shopify order, booked manually by staff
+}
+
+enum DamageType {
+  DAMAGED_IN_TRANSIT
+  DEFECTIVE
+  MARKETPLACE_DAMAGE
+  OFFLINE_PURCHASE_DAMAGE
+  WARRANTY_DEFECT
+  OTHER
+}
+
+enum ReplacementStatus {
+  PENDING_REVIEW   // awaiting approval (over the auto-approve value threshold)
+  APPROVED
+  ORDER_CREATED    // $0 draft order created in Shopify
+  FULFILLED
+  REJECTED
+}
+
+model ReplacementLineItem {
+  id                 String           @id @default(cuid())
+  replacementOrderId String
+  replacementOrder   ReplacementOrder @relation(fields: [replacementOrderId], references: [id])
+  productId          String
+  variantId          String
+  title              String
+  variantTitle       String?
+  quantity           Int              @default(1)
+  imageUrl           String?
+}
